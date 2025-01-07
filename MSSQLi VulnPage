@@ -1,0 +1,89 @@
+<%
+Option Explicit
+
+' ============================
+'  Step 1: Grab User Input
+' ============================
+Dim username, password
+username = Request.Form("username")
+password = Request.Form("password")
+
+
+' ============================
+'  Step 2: Build (Insecure) SQL Query
+' ============================
+' WARNING: This is deliberately vulnerable to SQL injection.
+Dim sqlQuery
+sqlQuery = "SELECT * FROM dbo.Users WHERE username = '" & username & _
+           "' AND password = '" & password & "'"
+
+' ============================
+'  Step 3: Create ADO Objects
+' ============================
+Dim conn, rs
+Set conn = Server.CreateObject("ADODB.Connection")
+Set rs   = Server.CreateObject("ADODB.Recordset")
+
+' ============================
+'  Step 4: Connect to SQL Server
+' ============================
+' IMPORTANT: Replace "SERVER_NAME" with your actual SQL Server name or IP.
+'            If it's local, try "localhost" or "127.0.0.1".
+'            Replace "YourSAPassword" with the actual SA or other SQL credentials.
+'
+'            Also verify SQL is set to Mixed Mode authentication
+'            and the account is not locked/disabled.
+'
+On Error Resume Next
+conn.Open "Provider=SQLOLEDB;Data Source=web04;Initial Catalog=master;Integrated Security=SSPI;"
+
+If Err.Number <> 0 Then
+    Response.Write "<h3>Connection Error: " & Err.Description & "</h3>"
+    Response.End
+End If
+On Error GoTo 0
+
+' ============================
+'  Step 5: Execute the Query
+' ============================
+On Error Resume Next
+Set rs = conn.Execute(sqlQuery)
+If Err.Number <> 0 Then
+    Response.Write "<h3>Query Error: " & Err.Description & "</h3>"
+    conn.Close
+    Set conn = Nothing
+    Response.End
+End If
+On Error GoTo 0
+
+' ============================
+'  Step 6: Check for Results
+' ============================
+If Not rs.EOF Then
+    Response.Write "<h3>Login success!</h3>"
+Else
+    Response.Write "<h3>Login failed.</h3>"
+End If
+
+' ============================
+'  Step 7: Clean up
+' ============================
+rs.Close
+conn.Close
+Set rs = Nothing
+Set conn = Nothing
+%>
+
+<html>
+<head>
+  <title>Very Insecure Login Form</title>
+</head>
+<body>
+  <h1>Very Insecure Login Form</h1>
+  <form method="POST" action="login.asp">
+    Username: <input type="text" name="username"><br/>
+    Password: <input type="password" name="password"><br/>
+    <input type="submit" value="Login">
+  </form>
+</body>
+</html>
