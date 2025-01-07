@@ -8,7 +8,6 @@ Dim username, password
 username = Request.Form("username")
 password = Request.Form("password")
 
-
 ' ============================
 '  Step 2: Build (Insecure) SQL Query
 ' ============================
@@ -35,7 +34,7 @@ Set rs   = Server.CreateObject("ADODB.Recordset")
 '            and the account is not locked/disabled.
 '
 On Error Resume Next
-conn.Open "Provider=SQLOLEDB;Data Source=web04;Initial Catalog=master;Integrated Security=SSPI;"
+conn.Open "Provider=SQLOLEDB;Data Source=web04;Initial Catalog=master;User ID=sa;Password=Password123!!;"
 
 If Err.Number <> 0 Then
     Response.Write "<h3>Connection Error: " & Err.Description & "</h3>"
@@ -46,32 +45,42 @@ On Error GoTo 0
 ' ============================
 '  Step 5: Execute the Query
 ' ============================
-On Error Resume Next
-Set rs = conn.Execute(sqlQuery)
-If Err.Number <> 0 Then
-    Response.Write "<h3>Query Error: " & Err.Description & "</h3>"
-    conn.Close
-    Set conn = Nothing
-    Response.End
+Dim loginAttempted
+loginAttempted = False
+
+If username <> "" Or password <> "" Then
+    loginAttempted = True
+    On Error Resume Next
+    Set rs = conn.Execute(sqlQuery)
+    If Err.Number <> 0 Then
+        Response.Write "<h3>Query Error: " & Err.Description & "</h3>"
+        conn.Close
+        Set conn = Nothing
+        Response.End
+    End If
+    On Error GoTo 0
 End If
-On Error GoTo 0
 
 ' ============================
 '  Step 6: Check for Results
 ' ============================
-If Not rs.EOF Then
-    Response.Write "<h3>Login success!</h3>"
-Else
-    Response.Write "<h3>Login failed.</h3>"
+If loginAttempted Then
+    If Not rs.EOF Then
+        Response.Write "<h3>Login success!</h3>"
+    Else
+        Response.Write "<h3>Login failed.</h3>"
+    End If
 End If
 
 ' ============================
 '  Step 7: Clean up
 ' ============================
-rs.Close
-conn.Close
-Set rs = Nothing
-Set conn = Nothing
+If loginAttempted Then
+    rs.Close
+    conn.Close
+    Set rs = Nothing
+    Set conn = Nothing
+End If
 %>
 
 <html>
