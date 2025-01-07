@@ -1,197 +1,206 @@
-import http.server
-import base64
+#!/usr/bin/env python3
 import os
+import sys
 import logging
-import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import base64
+import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 import gssapi
-import requests
-import requests_negotiate_sspi
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+KEYTAB_PATH = "FILE:C:\\Users\\daron.AD\\Documents\\web04.keytab"  # No placeholders
+LISTEN_PORT = 80
+FORWARD_HOST = "127.0.0.1"
+FORWARD_PORT = 8080
+LOG_LEVEL = logging.DEBUG
 
-###############################################################################
-# Main Kerberos-capable HTTP handler
-###############################################################################
-class KerberosHTTPRequestHandler(BaseHTTPRequestHandler):
+# -----------------------------------------------------------------------------
+# Logger setup
+# -----------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# -----------------------------------------------------------------------------
+# Set the keytab environment variable so the GSSAPI library uses it.
+# -----------------------------------------------------------------------------
+os.environ["KRB5_KTNAME"] = KEYTAB_PATH
+
+# -----------------------------------------------------------------------------
+# Kerberos/Negotiate Handler
+# -----------------------------------------------------------------------------
+class KerberosNegotiateHandler(BaseHTTPRequestHandler):
+    """
+    An HTTP handler that performs SPNEGO/Kerberos authentication, then
+    proxies valid requests to 127.0.0.1:8080. Returns 404 if file not found
+    upstream, or if the path is anything besides /login.asp (for example).
+    """
+
+    def do_AUTHHEAD(self, negotiate_token=None):
+        """
+        Send the 401 header with optional Negotiate token.
+        """
+        self.send_response(401, "Unauthorized")
+        if negotiate_token:
+            self.send_header("WWW-Authenticate", "Negotiate " + negotiate_token)
+        else:
+            self.send_header("WWW-Authenticate", "Negotiate")
+        self.end_headers()
+
+    def negotiate_step(self, in_token):
+        """
+        Perform one step in SPNEGO negotiation with GSSAPI.
+        Returns (out_token, completed_bool).
+        """
+        try:
+            # Acquire credentials from the keytab for the principal in the keytab
+            service_name = gssapi.Name("HTTP@{}".format(self.server.server_name),
+                                       gssapi.NameType.hostbased_service)
+            creds = gssapi.Credentials(name=service_name, usage='accept')
+
+            ctx = gssapi.SecurityContext(creds=creds, usage='accept')
+            out_token = ctx.step(in_token)
+
+            # If ctx is established, then we are done
+            return (out_token, ctx.complete)
+
+        except Exception as e:
+            logger.exception("GSSAPI negotiation step failed")
+            return (None, False)
+
     def do_GET(self):
         """
-        1. Attempt Kerberos authentication using GSSAPI.
-        2. If authentication succeeds, forward to IIS as the user.
-        3. Return the IIS response to the client.
+        Handles HTTP GET requests with Kerberos Negotiate auth and proxies them
+        if the user is authenticated. If the resource doesn't exist on upstream,
+        return 404.
         """
+        # 1. Check for 'Authorization: Negotiate ...' header
+        auth_header = self.headers.get('Authorization', '')
+        if not auth_header.startswith('Negotiate'):
+            # No token provided or not Negotiate -> challenge
+            logger.debug("No or invalid Auth header; requesting Negotiate")
+            self.do_AUTHHEAD()
+            return
+
+        # 2. Extract the SPNEGO token from the header
         try:
-            auth_header = self.headers.get("Authorization")
-            logging.debug(f"Authorization header received: {auth_header}")
-
-            # If there's no Negotiate header, request it:
-            if not auth_header or not auth_header.startswith("Negotiate "):
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", "Negotiate")
-                self.end_headers()
-                return
-
-            # Extract the Base64-encoded Kerberos token from client
-            token_b64 = auth_header.split(" ")[1]
-            logging.debug(f"Received Kerberos Token (Base64): {token_b64}")
-
-            # Decode the token
-            incoming_token = base64.b64decode(token_b64)
-            logging.debug(f"Decoded Kerberos Token (raw bytes): {incoming_token}")
-
-            # Acquire server credentials (for principal HTTP@web04.ad.set) from keytab
-            server_name = gssapi.Name(
-                "HTTP@web04.ad.set",
-                name_type=gssapi.NameType.hostbased_service
-            )
-            server_creds = gssapi.Credentials(name=server_name, usage='accept')
-
-            # Create a security context to 'accept' the incoming token
-            context = gssapi.SecurityContext(
-                creds=server_creds
-            )
-
-            # Process the incoming token
-            returned_token = context.step(incoming_token)
-
-            # If the context isn't complete, authentication failed
-            if not context.complete:
-                logging.error("GSSAPI context is not complete. Authentication failed.")
-                self.send_response(401)
-                self.end_headers()
-                return
-
-            # If the server wants to send a final token back to the client (rare), do so:
-            if returned_token:
-                # This sometimes happens if mutual_authentication is required
-                logging.debug("Sending final context token back to client.")
-                self.send_response(200)
-                self.send_header("WWW-Authenticate", "Negotiate " + base64.b64encode(returned_token).decode())
-                self.end_headers()
-                self.wfile.write(b"GSSAPI context established; final token sent.")
-                return
-
-            # If we've gotten here, the client is authenticated at our Python service
-            logging.info("Kerberos authentication successful.")
-
-            # Attempt to retrieve delegated credentials
-            delegated_creds = context.delegated_creds
-            if not delegated_creds:
-                logging.warning("No delegated credentials received. "
-                                "IIS will NOT see the user identity. "
-                                "Forwarding anonymously.")
-                # Forward the request anonymously
-                self.forward_to_iis_anonymously()
-                return
-
-            # If we do have delegated creds, let's forward to IIS using them
-            self.forward_to_iis_with_delegation()
-
-        except gssapi.exceptions.GSSError as e:
-            logging.error(f"GSSAPI Error: {e}")
-            logging.error(traceback.format_exc())
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b"Kerberos authentication failed (GSSAPI Error).")
+            token_base64 = auth_header.split()[1]
+            in_token = base64.b64decode(token_base64)
+            logger.debug(f"Incoming token (base64 decoded): {in_token}")
         except Exception as e:
-            logging.error(f"Unexpected Error: {e}")
-            logging.error(traceback.format_exc())
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b"Internal Server Error.")
+            logger.debug("Failed to parse SPNEGO token from header.")
+            self.do_AUTHHEAD()
+            return
 
-    def forward_to_iis_with_delegation(self):
-        """
-        Forward the authenticated request to IIS using delegated credentials.
-        """
-        # Define the backend IIS URL (adjust host and port as needed)
-        backend_url = f"http://web04.ad.set:8080{self.path}"
+        # 3. Perform the Kerberos negotiation step
+        out_token, completed = self.negotiate_step(in_token)
 
-        # Remove 'Host' header to allow `requests_negotiate_sspi` to set it correctly
-        headers = dict(self.headers)
-        headers.pop('Host', None)
+        if out_token:
+            # We have an output token to send back
+            # If the context is not complete, we still need more handshake
+            if not completed:
+                logger.debug("GSSAPI context not complete, sending 401 with SPNEGO token.")
+                self.do_AUTHHEAD(base64.b64encode(out_token).decode('ascii'))
+                return
+            else:
+                # Context is complete; send final token to client (if any)
+                logger.debug("GSSAPI context established; final token sent.")
+                self.send_response(200, "OK")
+                self.send_header("WWW-Authenticate", "Negotiate " + base64.b64encode(out_token).decode('ascii'))
+                self.end_headers()
+        else:
+            # If out_token is None or negotiation failed
+            logger.debug("No output token or negotiation failed.")
+            self.do_AUTHHEAD()
+            return
 
-        # Create the SSPI Negotiate Auth handler
-        auth = requests_negotiate_sspi.HTTPNegotiateAuth()
+        # 4. If we made it here, the client is authenticated. Now check path.
+        requested_path = self.path
+        logger.debug(f"Authenticated request for path: {requested_path}")
 
-        logging.debug(f"Forwarding to IIS with user credentials, URL: {backend_url}")
+        # ---------------------------------------------------------------------
+        # Customize the resource check logic:
+        #
+        # If you want to serve only /login.asp from your upstream, you can do:
+        #     if requested_path != '/login.asp':
+        #         self.send_error(404, "File does not exist")
+        #         return
+        #
+        # Otherwise, adapt to your needs. The snippet below only proxies
+        # /login.asp or returns 404 for everything else.
+        # ---------------------------------------------------------------------
+        if requested_path.lower() != "/login.asp":
+            logger.debug(f"Requested path {requested_path} not found. Returning 404.")
+            self.send_error(404, "File does not exist")
+            return
+
+        # 5. Proxy the request to the upstream server (IIS on 127.0.0.1:8080)
+        upstream_url = f"http://{FORWARD_HOST}:{FORWARD_PORT}{requested_path}"
+        logger.debug(f"Proxying GET to {upstream_url}")
+
         try:
-            response = requests.get(backend_url, headers=headers, allow_redirects=False, auth=auth)
+            resp = requests.get(upstream_url)
+            # If the file doesn't exist upstream, we return 404 to the client
+            if resp.status_code == 404:
+                logger.debug("Upstream returned 404, returning 404 to client.")
+                self.send_error(404, "File does not exist")
+                return
 
-            # Relay IIS status code back to the client
-            self.send_response(response.status_code)
-
-            # Relay IIS headers
-            for key, value in response.headers.items():
-                self.send_header(key, value)
+            # Otherwise, pass along the status and content
+            self.send_response(resp.status_code)
+            for key, value in resp.headers.items():
+                # Filter out headers that Python's http server will manage on its own.
+                if key.lower() not in ["transfer-encoding", "content-encoding", "content-length", "connection"]:
+                    self.send_header(key, value)
             self.end_headers()
+            self.wfile.write(resp.content)
+        except Exception as exc:
+            logger.exception("Error proxying request to upstream.")
+            self.send_error(502, f"Bad Gateway: {exc}")
 
-            # Relay IIS response body
-            self.wfile.write(response.content)
-
-        except requests.RequestException as e:
-            logging.error(f"Error forwarding to IIS with delegation: {e}")
-            logging.error(traceback.format_exc())
-            self.send_response(502)
-            self.end_headers()
-            self.wfile.write(b"Bad Gateway (delegation failure)")
-
-    def forward_to_iis_anonymously(self):
+    def do_POST(self):
         """
-        Forward the request to IIS without user credentials.
-        IIS will treat the request as anonymous.
+        If you need POST support, replicate do_GET logic with appropriate handling.
+        For now, we’ll return 405 (Method Not Allowed) if not desired.
         """
-        # Define the backend IIS URL (adjust host and port as needed)
-        backend_url = f"http://web04.ad.set:8080{self.path}"
+        logger.debug("Received POST request; returning 405 for now.")
+        self.send_error(405, "Method Not Allowed")
 
-        # Remove 'Host' header to allow `requests` to set it correctly
-        headers = dict(self.headers)
-        headers.pop('Host', None)
+# -----------------------------------------------------------------------------
+# Threading HTTP Server
+# -----------------------------------------------------------------------------
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
 
-        logging.debug(f"Forwarding to IIS anonymously, URL: {backend_url}")
-        try:
-            response = requests.get(backend_url, headers=headers, allow_redirects=False)
+# -----------------------------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------------------------
+def main():
+    # Display config
+    logger.info(f"Keytab: {KEYTAB_PATH}")
+    logger.info(f"Listening on port {LISTEN_PORT}. Forwarding /login.asp to {FORWARD_HOST}:{FORWARD_PORT}")
 
-            # Relay IIS status code back to the client
-            self.send_response(response.status_code)
+    server_address = ('0.0.0.0', LISTEN_PORT)
+    httpd = ThreadedHTTPServer(server_address, KerberosNegotiateHandler)
 
-            # Relay IIS headers
-            for key, value in response.headers.items():
-                self.send_header(key, value)
-            self.end_headers()
-
-            # Relay IIS response body
-            self.wfile.write(response.content)
-
-        except requests.RequestException as e:
-            logging.error(f"Error forwarding to IIS anonymously: {e}")
-            logging.error(traceback.format_exc())
-            self.send_response(502)
-            self.end_headers()
-            self.wfile.write(b"Bad Gateway (anonymous forwarding)")
-
-###############################################################################
-# HTTP server bootstrap
-###############################################################################
-def run_server(port=80):
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, KerberosHTTPRequestHandler)
-    logging.info(f"Serving on port {port}...")
-    httpd.serve_forever()
-
-if __name__ == "__main__":
-    # Force MIT Kerberos for Windows to load the specified keytab.
-    # Use 'FILE:' prefix so MIT KfW treats it as a file-based keytab:
-    keytab_path = r"FILE:C:\Users\daron.AD\Documents\web04.keytab"
-    os.environ["KRB5_KTNAME"] = keytab_path
-    logging.info(f"Using keytab file: {keytab_path}")
+    # If you want to specify a custom 'server_name', you can do so here:
+    # e.g. httpd.server_name = 'web04.ad.set'
+    # but for correctness, ensure it matches your keytab principal name.
+    httpd.server_name = 'web04.ad.set'
 
     try:
-        run_server()
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        logging.info("Server stopped by user.")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
+        logger.info("Server stopped by user.")
+    finally:
+        httpd.server_close()
+
+if __name__ == "__main__":
+    main()
