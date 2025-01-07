@@ -1,0 +1,83 @@
+import http.server
+import socketserver
+import base64
+import os
+import logging
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import gssapi
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class KerberosHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            auth_header = self.headers.get("Authorization")
+            logging.debug(f"Authorization header received: {auth_header}")
+
+            # If there's no Negotiate header, ask the client to authenticate
+            if not auth_header or not auth_header.startswith("Negotiate "):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Negotiate")
+                self.end_headers()
+                return
+
+            # Extract the Base64 token
+            token_b64 = auth_header.split(" ")[1]
+            logging.debug(f"Received Kerberos Token (Base64): {token_b64}")
+
+            # Decode the token from Base64
+            token = base64.b64decode(token_b64)
+            logging.debug(f"Decoded Kerberos Token (raw bytes): {token}")
+
+            # Acquire credentials for the specific service principal: HTTP/web04.ad.set
+            # Usage = 'accept' means this is a server accepting client tickets
+            server_name = gssapi.Name(
+                "HTTP@web04.ad.set",
+                name_type=gssapi.NameType.hostbased_service
+            )
+            server_creds = gssapi.Credentials(name=server_name, usage='accept')
+
+            # Create the security context in 'accept' mode
+            context = gssapi.SecurityContext(creds=server_creds, usage='accept')
+
+            # Attempt to process the incoming token
+            returned_token = context.step(token)
+
+            # Verify if the context is fully established
+            if not context.complete:
+                logging.error("GSSAPI context is not complete. Authentication failed.")
+                self.send_response(401)
+                self.end_headers()
+                return
+
+            logging.info("Kerberos authentication successful.")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Authentication successful.")
+
+        except gssapi.exceptions.GSSError as e:
+            logging.error(f"GSSAPI Error: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"Internal Server Error: Kerberos authentication failed.")
+
+def run_server(port=8000):
+    server_address = ('', port)
+    httpd = HTTPServer(server_address, KerberosHTTPRequestHandler)
+    logging.info(f"Serving on port {port}...")
+    httpd.serve_forever()
+
+if __name__ == "__main__":
+    # Force MIT Kerberos for Windows to load the specified keytab.
+    # Use 'FILE:' prefix so MIT KfW treats it as a file-based keytab:
+    keytab_path = r"FILE:C:\Users\daron.AD\Documents\web04.keytab"
+    os.environ["KRB5_KTNAME"] = keytab_path
+    logging.info(f"Using keytab file: {keytab_path}")
+
+    try:
+        run_server()
+    except KeyboardInterrupt:
+        logging.info("Server stopped by user.")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
