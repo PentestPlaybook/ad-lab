@@ -4,13 +4,22 @@ import base64
 import os
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import gssapi
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class KerberosHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        """
+        Handle GET requests:
+        1. Attempt Kerberos authentication.
+        2. If successful, reverse-proxy the request to IIS on port 8080.
+        3. Return the IIS response to the client.
+        """
+
         try:
             auth_header = self.headers.get("Authorization")
             logging.debug(f"Authorization header received: {auth_header}")
@@ -31,7 +40,6 @@ class KerberosHTTPRequestHandler(BaseHTTPRequestHandler):
             logging.debug(f"Decoded Kerberos Token (raw bytes): {token}")
 
             # Acquire credentials for the specific service principal: HTTP/web04.ad.set
-            # Usage = 'accept' means this is a server accepting client tickets
             server_name = gssapi.Name(
                 "HTTP@web04.ad.set",
                 name_type=gssapi.NameType.hostbased_service
@@ -52,9 +60,9 @@ class KerberosHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
 
             logging.info("Kerberos authentication successful.")
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Authentication successful.")
+
+            # If Kerberos auth is successful, forward the request to IIS on port 8080
+            self.forward_to_iis()
 
         except gssapi.exceptions.GSSError as e:
             logging.error(f"GSSAPI Error: {e}")
@@ -62,15 +70,54 @@ class KerberosHTTPRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Internal Server Error: Kerberos authentication failed.")
 
-def run_server(port=8000):
+    def forward_to_iis(self):
+        """
+        Reverse-proxy the current GET request to a backend server (IIS on port 8080),
+        then send the backend's response back to the client.
+        """
+
+        # Construct the URL to which we are proxying
+        # (Here, we assume IIS is running on the same host, on port 8080)
+        backend_url = f"http://127.0.0.1:8080{self.path}"
+
+        # Copy headers from the client request, but remove Host (so requests can re-set it).
+        # You can remove or modify other headers here as needed.
+        headers = dict(self.headers)
+        headers.pop('Host', None)
+
+        try:
+            # Forward the GET request to the backend (IIS) using 'requests'
+            response = requests.get(backend_url, headers=headers, allow_redirects=False)
+
+            # Send status code from the IIS response
+            self.send_response(response.status_code)
+
+            # Forward headers from the IIS response
+            for key, value in response.headers.items():
+                # Important: Some headers like 'Transfer-Encoding' might cause issues;
+                # adjust logic as needed.
+                self.send_header(key, value)
+            self.end_headers()
+
+            # Write the body (ASP-rendered HTML, etc.) from IIS back to the client
+            self.wfile.write(response.content)
+
+        except requests.RequestException as e:
+            # If there's any error in connecting or forwarding, send a 502 Bad Gateway.
+            logging.error(f"Error forwarding to IIS: {e}")
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(b"Bad Gateway")
+
+
+def run_server(port=80):
     server_address = ('', port)
     httpd = HTTPServer(server_address, KerberosHTTPRequestHandler)
     logging.info(f"Serving on port {port}...")
     httpd.serve_forever()
 
 if __name__ == "__main__":
-    # Force MIT Kerberos for Windows to load the specified keytab.
-    # Use 'FILE:' prefix so MIT KfW treats it as a file-based keytab:
+    # Force MIT Kerberos for Windows to load the specified keytab
     keytab_path = r"FILE:C:\Users\daron.AD\Documents\web04.keytab"
     os.environ["KRB5_KTNAME"] = keytab_path
     logging.info(f"Using keytab file: {keytab_path}")
