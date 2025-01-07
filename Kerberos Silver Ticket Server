@@ -40,7 +40,7 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
     """
     An HTTP handler that performs SPNEGO/Kerberos authentication, then
     proxies valid requests to 127.0.0.1:8080. Returns 404 if file not found
-    upstream, or if the path is anything besides /login.asp (for example).
+    upstream, or if the path is not /login.asp (adjust as needed).
     """
 
     def do_AUTHHEAD(self, negotiate_token=None):
@@ -61,25 +61,25 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
         """
         try:
             # Acquire credentials from the keytab for the principal in the keytab
-            service_name = gssapi.Name("HTTP@{}".format(self.server.server_name),
-                                       gssapi.NameType.hostbased_service)
+            service_name = gssapi.Name(
+                "HTTP@{}".format(self.server.server_name),
+                gssapi.NameType.hostbased_service
+            )
             creds = gssapi.Credentials(name=service_name, usage='accept')
-
             ctx = gssapi.SecurityContext(creds=creds, usage='accept')
-            out_token = ctx.step(in_token)
 
-            # If ctx is established, then we are done
+            out_token = ctx.step(in_token)
             return (out_token, ctx.complete)
 
         except Exception as e:
             logger.exception("GSSAPI negotiation step failed")
             return (None, False)
 
-    def do_GET(self):
+    def authenticate_kerberos(self):
         """
-        Handles HTTP GET requests with Kerberos Negotiate auth and proxies them
-        if the user is authenticated. If the resource doesn't exist on upstream,
-        return 404.
+        Common Kerberos/Negotiate authentication logic. 
+        Returns True if fully authenticated, otherwise False (and a 401 is sent).
+        Also sends final or intermediate tokens if negotiation is ongoing.
         """
         # 1. Check for 'Authorization: Negotiate ...' header
         auth_header = self.headers.get('Authorization', '')
@@ -87,91 +87,145 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
             # No token provided or not Negotiate -> challenge
             logger.debug("No or invalid Auth header; requesting Negotiate")
             self.do_AUTHHEAD()
-            return
+            return False
 
         # 2. Extract the SPNEGO token from the header
         try:
             token_base64 = auth_header.split()[1]
             in_token = base64.b64decode(token_base64)
             logger.debug(f"Incoming token (base64 decoded): {in_token}")
-        except Exception as e:
+        except Exception:
             logger.debug("Failed to parse SPNEGO token from header.")
             self.do_AUTHHEAD()
-            return
+            return False
 
         # 3. Perform the Kerberos negotiation step
         out_token, completed = self.negotiate_step(in_token)
-
         if out_token:
-            # We have an output token to send back
-            # If the context is not complete, we still need more handshake
             if not completed:
+                # Not done yet; send the partially completed token back
                 logger.debug("GSSAPI context not complete, sending 401 with SPNEGO token.")
                 self.do_AUTHHEAD(base64.b64encode(out_token).decode('ascii'))
-                return
+                return False
             else:
-                # Context is complete; send final token to client (if any)
+                # Context is complete; send final token (if any) and 200
                 logger.debug("GSSAPI context established; final token sent.")
                 self.send_response(200, "OK")
                 self.send_header("WWW-Authenticate", "Negotiate " + base64.b64encode(out_token).decode('ascii'))
                 self.end_headers()
         else:
-            # If out_token is None or negotiation failed
+            # out_token is None or negotiation failed
             logger.debug("No output token or negotiation failed.")
             self.do_AUTHHEAD()
+            return False
+
+        return True
+
+    def do_GET(self):
+        """
+        Handles HTTP GET requests with Kerberos Negotiate auth and proxies them
+        if the user is authenticated. If the resource doesn't exist on upstream,
+        return 404.
+        """
+        # 1. Kerberos authenticate
+        if not self.authenticate_kerberos():
             return
 
-        # 4. If we made it here, the client is authenticated. Now check path.
+        # 2. If we get here, user is authenticated
         requested_path = self.path
-        logger.debug(f"Authenticated request for path: {requested_path}")
+        logger.debug(f"Authenticated GET request for path: {requested_path}")
 
-        # ---------------------------------------------------------------------
-        # Customize the resource check logic:
-        #
-        # If you want to serve only /login.asp from your upstream, you can do:
-        #     if requested_path != '/login.asp':
-        #         self.send_error(404, "File does not exist")
-        #         return
-        #
-        # Otherwise, adapt to your needs. The snippet below only proxies
-        # /login.asp or returns 404 for everything else.
-        # ---------------------------------------------------------------------
+        # 3. Check path
+        #    For demonstration, we only allow /login.asp
         if requested_path.lower() != "/login.asp":
             logger.debug(f"Requested path {requested_path} not found. Returning 404.")
             self.send_error(404, "File does not exist")
             return
 
-        # 5. Proxy the request to the upstream server (IIS on 127.0.0.1:8080)
+        # 4. Proxy request to upstream server
         upstream_url = f"http://{FORWARD_HOST}:{FORWARD_PORT}{requested_path}"
         logger.debug(f"Proxying GET to {upstream_url}")
 
         try:
             resp = requests.get(upstream_url)
-            # If the file doesn't exist upstream, we return 404 to the client
             if resp.status_code == 404:
+                # If upstream returns 404, forward that back
                 logger.debug("Upstream returned 404, returning 404 to client.")
                 self.send_error(404, "File does not exist")
                 return
 
-            # Otherwise, pass along the status and content
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
-                # Filter out headers that Python's http server will manage on its own.
                 if key.lower() not in ["transfer-encoding", "content-encoding", "content-length", "connection"]:
                     self.send_header(key, value)
             self.end_headers()
             self.wfile.write(resp.content)
+
         except Exception as exc:
-            logger.exception("Error proxying request to upstream.")
+            logger.exception("Error proxying GET request.")
             self.send_error(502, f"Bad Gateway: {exc}")
 
     def do_POST(self):
         """
-        If you need POST support, replicate do_GET logic with appropriate handling.
-        For now, we’ll return 405 (Method Not Allowed) if not desired.
+        Handles HTTP POST requests similarly to do_GET, except we also read
+        the request body and proxy it to the upstream server.
         """
-        logger.debug("Received POST request; returning 405 for now.")
-        self.send_error(405, "Method Not Allowed")
+        # 1. Kerberos authenticate
+        if not self.authenticate_kerberos():
+            return
+
+        requested_path = self.path
+        logger.debug(f"Authenticated POST request for path: {requested_path}")
+
+        # 2. Check path (same check as in do_GET)
+        if requested_path.lower() != "/login.asp":
+            logger.debug(f"Requested path {requested_path} not found. Returning 404.")
+            self.send_error(404, "File does not exist")
+            return
+
+        # 3. Read the POST data from the client
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+
+        # 4. Proxy the POST to upstream
+        upstream_url = f"http://{FORWARD_HOST}:{FORWARD_PORT}{requested_path}"
+        logger.debug(f"Proxying POST to {upstream_url}")
+        logger.debug(f"POST data: {post_data}")
+
+        # Forward relevant headers
+        # (Filter out certain hop-by-hop headers like Connection, Transfer-Encoding, etc.)
+        forward_headers = {}
+        for h in self.headers:
+            if h.lower() not in ["host", "content-length", "connection", "transfer-encoding"]:
+                forward_headers[h] = self.headers[h]
+        # Make sure we keep the same Content-Type if present
+        if 'content-type' not in forward_headers:
+            forward_headers['Content-Type'] = self.headers.get('Content-Type', 'application/octet-stream')
+
+        try:
+            resp = requests.post(
+                upstream_url,
+                data=post_data,
+                headers=forward_headers,
+                allow_redirects=False
+            )
+
+            # Pass along the upstream status
+            self.send_response(resp.status_code)
+
+            # Pass along the upstream headers
+            for key, value in resp.headers.items():
+                if key.lower() not in ["transfer-encoding", "content-encoding", "content-length", "connection"]:
+                    self.send_header(key, value)
+            self.end_headers()
+
+            # Pass along the upstream body
+            self.wfile.write(resp.content)
+
+        except Exception as exc:
+            logger.exception("Error proxying POST request.")
+            self.send_error(502, f"Bad Gateway: {exc}")
+
 
 # -----------------------------------------------------------------------------
 # Threading HTTP Server
@@ -190,9 +244,7 @@ def main():
     server_address = ('0.0.0.0', LISTEN_PORT)
     httpd = ThreadedHTTPServer(server_address, KerberosNegotiateHandler)
 
-    # If you want to specify a custom 'server_name', you can do so here:
-    # e.g. httpd.server_name = 'web04.ad.set'
-    # but for correctness, ensure it matches your keytab principal name.
+    # Ensure the server name here matches your keytab principal: HTTP/web04.ad.set
     httpd.server_name = 'web04.ad.set'
 
     try:
