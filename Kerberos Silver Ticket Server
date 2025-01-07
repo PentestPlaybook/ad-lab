@@ -12,7 +12,7 @@ import gssapi
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-KEYTAB_PATH = "FILE:C:\\Users\\daron.AD\\Documents\\web04.keytab"  # No placeholders
+KEYTAB_PATH = "FILE:C:\\Users\\daron.AD\\Documents\\web04.keytab"
 LISTEN_PORT = 80
 FORWARD_HOST = "127.0.0.1"
 FORWARD_PORT = 8080
@@ -40,7 +40,7 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
     """
     An HTTP handler that performs SPNEGO/Kerberos authentication, then
     proxies valid requests to 127.0.0.1:8080. Returns 404 if file not found
-    upstream, or if the path is not /login.asp (adjust as needed).
+    upstream, or if the path is not /login.asp .
     """
 
     def do_AUTHHEAD(self, negotiate_token=None):
