@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import sys
 import logging
@@ -6,8 +5,8 @@ import base64
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-
 import gssapi
+from ldap3 import Server, Connection, ALL, NTLM
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -17,6 +16,16 @@ LISTEN_PORT = 80
 FORWARD_HOST = "127.0.0.1"
 FORWARD_PORT = 8080
 LOG_LEVEL = logging.DEBUG
+
+# LDAP Configuration
+LDAP_SERVER = 'ldaps://dc02.ad.set'          # Replace with your AD server address
+LDAP_USER = 'AD\\betty'               # Service account with read access to AD
+LDAP_PASSWORD = 'Password123'              # Password for the service account
+AUTHORIZED_USERS = {
+    "AD\\DOES-NOT-EXIST",
+    "DOES-NOT-EXIST@AD.SET"
+}  # AD usernames in uppercase (DOMAIN\username and username@DOMAIN)
+AUTHORIZED_GROUPS = {"ADMINISTRATORS"}       # AD group names in uppercase
 
 # -----------------------------------------------------------------------------
 # Logger setup
@@ -34,14 +43,72 @@ logging.basicConfig(
 os.environ["KRB5_KTNAME"] = KEYTAB_PATH
 
 # -----------------------------------------------------------------------------
+# LDAP Helper Functions
+# -----------------------------------------------------------------------------
+def get_user_groups(principal_name):
+    """
+    Query Active Directory to get the groups of the given principal.
+    Returns a set of group names in uppercase.
+    """
+    try:
+        # Initialize LDAP server and connection
+        server = Server(LDAP_SERVER, get_info=ALL, use_ssl=True)
+        conn = Connection(server, user=LDAP_USER, password=LDAP_PASSWORD, authentication=NTLM, auto_bind=True)
+
+        # Normalize and split principal name into domain and username
+        if '\\' in principal_name:
+            domain, username = principal_name.split('\\', 1)
+        elif '@' in principal_name:
+            username, domain_full = principal_name.split('@', 1)
+            # Optionally, extract short domain name if needed
+            domain = domain_full.split('.')[0].upper()
+        else:
+            logger.error(f"Unrecognized principal name format: {principal_name}")
+            return set()
+
+        username = username.strip()
+
+        # Search for the user
+        search_base = 'DC=ad,DC=set'  # Adjust based on your AD structure
+        search_filter = f'(&(objectClass=user)(sAMAccountName={username}))'
+        conn.search(search_base, search_filter, attributes=['memberOf'])
+
+        if not conn.entries:
+            logger.error(f"User {username} not found in AD.")
+            return set()
+
+        user_entry = conn.entries[0]
+        member_of = user_entry.memberOf.values if 'memberOf' in user_entry else []
+
+        # Extract group names from distinguished names and normalize to uppercase
+        groups = set()
+        for dn in member_of:
+            # Assuming the group name is the CN
+            parts = dn.split(',')
+            for part in parts:
+                if part.startswith('CN='):
+                    group_name = part[3:].strip().upper()  # Convert to uppercase
+                    groups.add(group_name)
+                    break  # Only the CN part is needed
+
+        conn.unbind()
+        return groups
+
+    except Exception as e:
+        logger.exception("Failed to retrieve user groups from AD.")
+        return set()
+
+# -----------------------------------------------------------------------------
 # Kerberos/Negotiate Handler
 # -----------------------------------------------------------------------------
 class KerberosNegotiateHandler(BaseHTTPRequestHandler):
     """
-    An HTTP handler that performs SPNEGO/Kerberos authentication, then
-    proxies valid requests to 127.0.0.1:8080. Returns 404 if file not found
-    upstream, or if the path is not /login.asp .
+    An HTTP handler that performs SPNEGO/Kerberos authentication, enforces
+    authorization based on individual user accounts or group membership, and proxies
+    valid requests to 127.0.0.1:8080. Returns 404 if file not found upstream,
+    403 if unauthorized, or if the path is not /login.asp.
     """
+    protocol_version = "HTTP/1.1"  # Ensure responses use HTTP/1.1
 
     def do_AUTHHEAD(self, negotiate_token=None):
         """
@@ -52,12 +119,14 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
             self.send_header("WWW-Authenticate", "Negotiate " + negotiate_token)
         else:
             self.send_header("WWW-Authenticate", "Negotiate")
+        self.send_header("Content-Length", "0")  # No body
+        self.send_header("Connection", "close")  # Close the connection
         self.end_headers()
 
     def negotiate_step(self, in_token):
         """
         Perform one step in SPNEGO negotiation with GSSAPI.
-        Returns (out_token, completed_bool).
+        Returns (out_token, completed_bool, context).
         """
         try:
             # Acquire credentials from the keytab for the principal in the keytab
@@ -69,16 +138,16 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
             ctx = gssapi.SecurityContext(creds=creds, usage='accept')
 
             out_token = ctx.step(in_token)
-            return (out_token, ctx.complete)
+            return (out_token, ctx.complete, ctx)
 
         except Exception as e:
             logger.exception("GSSAPI negotiation step failed")
-            return (None, False)
+            return (None, False, None)
 
     def authenticate_kerberos(self):
         """
         Common Kerberos/Negotiate authentication logic. 
-        Returns True if fully authenticated, otherwise False (and a 401 is sent).
+        Returns the authenticated principal name if successful, otherwise None.
         Also sends final or intermediate tokens if negotiation is ongoing.
         """
         # 1. Check for 'Authorization: Negotiate ...' header
@@ -87,7 +156,7 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
             # No token provided or not Negotiate -> challenge
             logger.debug("No or invalid Auth header; requesting Negotiate")
             self.do_AUTHHEAD()
-            return False
+            return None
 
         # 2. Extract the SPNEGO token from the header
         try:
@@ -97,52 +166,90 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.debug("Failed to parse SPNEGO token from header.")
             self.do_AUTHHEAD()
-            return False
+            return None
 
         # 3. Perform the Kerberos negotiation step
-        out_token, completed = self.negotiate_step(in_token)
+        out_token, completed, ctx = self.negotiate_step(in_token)
         if out_token:
             if not completed:
                 # Not done yet; send the partially completed token back
                 logger.debug("GSSAPI context not complete, sending 401 with SPNEGO token.")
                 self.do_AUTHHEAD(base64.b64encode(out_token).decode('ascii'))
-                return False
+                return None
             else:
-                # Context is complete; send final token (if any) and 200
-                logger.debug("GSSAPI context established; final token sent.")
-                self.send_response(200, "OK")
-                self.send_header("WWW-Authenticate", "Negotiate " + base64.b64encode(out_token).decode('ascii'))
-                self.end_headers()
+                # Context is complete; proceed without sending headers
+                logger.debug("GSSAPI context established; proceeding to handle request.")
         else:
             # out_token is None or negotiation failed
             logger.debug("No output token or negotiation failed.")
             self.do_AUTHHEAD()
-            return False
+            return None
 
-        return True
+        # 4. Extract the authenticated user's principal name
+        try:
+            user_name = str(ctx.initiator_name).upper()  # Normalize to uppercase
+            logger.debug(f"Authenticated user: {user_name}")
+            return user_name
+        except Exception as e:
+            logger.exception("Failed to extract user identity from GSSAPI context.")
+            return None
+
+    def authorize_user(self, principal_name):
+        """
+        Check if the authenticated user is authorized to access the resource based on
+        individual user accounts or group membership.
+        Returns True if authorized, False otherwise.
+        """
+        # Retrieve user groups from AD
+        groups = get_user_groups(principal_name)
+        logger.debug(f"User {principal_name} is member of groups: {groups}")
+        logger.debug(f"Normalized Authorized Groups: {AUTHORIZED_GROUPS}")
+
+        # Normalize principal name for comparison (already uppercase)
+        principal_normalized = principal_name  # Already uppercase
+
+        # Check if user is in authorized users
+        if principal_normalized in AUTHORIZED_USERS:
+            logger.debug(f"User {principal_name} is explicitly authorized.")
+            return True
+
+        # Check if user is in any authorized group
+        if AUTHORIZED_GROUPS.intersection(groups):
+            logger.debug(f"User {principal_name} is authorized via group membership.")
+            return True
+
+        logger.debug(f"User {principal_name} is not authorized.")
+        return False
 
     def do_GET(self):
         """
         Handles HTTP GET requests with Kerberos Negotiate auth and proxies them
-        if the user is authenticated. If the resource doesn't exist on upstream,
+        if the user is authenticated and authorized. If the resource doesn't exist on upstream,
         return 404.
         """
         # 1. Kerberos authenticate
-        if not self.authenticate_kerberos():
+        principal = self.authenticate_kerberos()
+        if not principal:
             return
 
-        # 2. If we get here, user is authenticated
-        requested_path = self.path
-        logger.debug(f"Authenticated GET request for path: {requested_path}")
+        # 2. Authorization check
+        if not self.authorize_user(principal):
+            logger.debug(f"Authorization failed for user: {principal}")
+            self.send_error(403, "Forbidden: You don't have permission to access this resource.")
+            return
 
-        # 3. Check path
+        # 3. If authorized, proceed
+        requested_path = self.path
+        logger.debug(f"Authorized GET request for path: {requested_path}")
+
+        # 4. Check path
         #    For demonstration, we only allow /login.asp
         if requested_path.lower() != "/login.asp":
             logger.debug(f"Requested path {requested_path} not found. Returning 404.")
             self.send_error(404, "File does not exist")
             return
 
-        # 4. Proxy request to upstream server
+        # 5. Proxy request to upstream server
         upstream_url = f"http://{FORWARD_HOST}:{FORWARD_PORT}{requested_path}"
         logger.debug(f"Proxying GET to {upstream_url}")
 
@@ -154,12 +261,26 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "File does not exist")
                 return
 
+            # Send the upstream status
             self.send_response(resp.status_code)
+
+            # Forward relevant headers
+            # Only forward essential headers to avoid conflicts
             for key, value in resp.headers.items():
-                if key.lower() not in ["transfer-encoding", "content-encoding", "content-length", "connection"]:
+                if key.lower() in ["content-type", "location", "set-cookie"]:
                     self.send_header(key, value)
+
+            # Manually set Content-Length
+            self.send_header("Content-Length", str(len(resp.content)))
+
+            # Set Connection to close to prevent lingering connections
+            self.send_header("Connection", "close")
+
             self.end_headers()
+
+            # Send the response content
             self.wfile.write(resp.content)
+            self.wfile.flush()  # Ensure all data is sent
 
         except Exception as exc:
             logger.exception("Error proxying GET request.")
@@ -167,27 +288,36 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """
-        Handles HTTP POST requests similarly to do_GET, except we also read
-        the request body and proxy it to the upstream server.
+        Handles HTTP POST requests with Kerberos Negotiate auth and proxies them
+        if the user is authenticated and authorized. If the resource doesn't exist on upstream,
+        return 404.
         """
         # 1. Kerberos authenticate
-        if not self.authenticate_kerberos():
+        principal = self.authenticate_kerberos()
+        if not principal:
             return
 
-        requested_path = self.path
-        logger.debug(f"Authenticated POST request for path: {requested_path}")
+        # 2. Authorization check
+        if not self.authorize_user(principal):
+            logger.debug(f"Authorization failed for user: {principal}")
+            self.send_error(403, "Forbidden: You don't have permission to access this resource.")
+            return
 
-        # 2. Check path (same check as in do_GET)
+        # 3. If authorized, proceed
+        requested_path = self.path
+        logger.debug(f"Authorized POST request for path: {requested_path}")
+
+        # 4. Check path (same check as in do_GET)
         if requested_path.lower() != "/login.asp":
             logger.debug(f"Requested path {requested_path} not found. Returning 404.")
             self.send_error(404, "File does not exist")
             return
 
-        # 3. Read the POST data from the client
+        # 5. Read the POST data from the client
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
 
-        # 4. Proxy the POST to upstream
+        # 6. Proxy the POST to upstream server
         upstream_url = f"http://{FORWARD_HOST}:{FORWARD_PORT}{requested_path}"
         logger.debug(f"Proxying POST to {upstream_url}")
         logger.debug(f"POST data: {post_data}")
@@ -215,17 +345,24 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
 
             # Pass along the upstream headers
             for key, value in resp.headers.items():
-                if key.lower() not in ["transfer-encoding", "content-encoding", "content-length", "connection"]:
+                if key.lower() in ["content-type", "location", "set-cookie"]:
                     self.send_header(key, value)
+
+            # Manually set Content-Length
+            self.send_header("Content-Length", str(len(resp.content)))
+
+            # Set Connection to close to prevent lingering connections
+            self.send_header("Connection", "close")
+
             self.end_headers()
 
             # Pass along the upstream body
             self.wfile.write(resp.content)
+            self.wfile.flush()  # Ensure all data is sent
 
         except Exception as exc:
             logger.exception("Error proxying POST request.")
             self.send_error(502, f"Bad Gateway: {exc}")
-
 
 # -----------------------------------------------------------------------------
 # Threading HTTP Server
@@ -244,7 +381,7 @@ def main():
     server_address = ('0.0.0.0', LISTEN_PORT)
     httpd = ThreadedHTTPServer(server_address, KerberosNegotiateHandler)
 
-    # Ensure the server name here matches your keytab principal: HTTP/web04.ad.set
+    # Ensure the server name matches your keytab principal: HTTP/web04.ad.set
     httpd.server_name = 'web04.ad.set'
 
     try:
