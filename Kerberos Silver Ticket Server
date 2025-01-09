@@ -6,7 +6,6 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import gssapi
-from ldap3 import Server, Connection, ALL, NTLM
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -17,15 +16,11 @@ FORWARD_HOST = "127.0.0.1"
 FORWARD_PORT = 8080
 LOG_LEVEL = logging.DEBUG
 
-# LDAP Configuration
-LDAP_SERVER = 'ldaps://dc02.ad.set'          # Replace with your AD server address
-LDAP_USER = 'AD\\betty'               # Service account with read access to AD
-LDAP_PASSWORD = 'Password123'              # Password for the service account
+# Authorized Users Configuration
 AUTHORIZED_USERS = {
     "AD\\IIS_SERVICE",
     "IIS_SERVICE@AD.SET"
-}  # AD usernames in uppercase (DOMAIN\username and username@DOMAIN)
-AUTHORIZED_GROUPS = {"ADMINISTRATORS"}       # AD group names in uppercase
+}  # AD usernames in uppercase (DOMAIN\\username and username@DOMAIN)
 
 # -----------------------------------------------------------------------------
 # Logger setup
@@ -43,60 +38,23 @@ logging.basicConfig(
 os.environ["KRB5_KTNAME"] = KEYTAB_PATH
 
 # -----------------------------------------------------------------------------
-# LDAP Helper Functions
+# Authorization Helper Function
 # -----------------------------------------------------------------------------
-def get_user_groups(principal_name):
+def authorize_user(principal_name):
     """
-    Query Active Directory to get the groups of the given principal.
-    Returns a set of group names in uppercase.
+    Check if the authenticated user is authorized based on the AUTHORIZED_USERS set.
+    Returns True if authorized, False otherwise.
     """
-    try:
-        # Initialize LDAP server and connection
-        server = Server(LDAP_SERVER, get_info=ALL, use_ssl=True)
-        conn = Connection(server, user=LDAP_USER, password=LDAP_PASSWORD, authentication=NTLM, auto_bind=True)
+    # Normalize principal name for comparison (already uppercase)
+    principal_normalized = principal_name.upper()
 
-        # Normalize and split principal name into domain and username
-        if '\\' in principal_name:
-            domain, username = principal_name.split('\\', 1)
-        elif '@' in principal_name:
-            username, domain_full = principal_name.split('@', 1)
-            # Optionally, extract short domain name if needed
-            domain = domain_full.split('.')[0].upper()
-        else:
-            logger.error(f"Unrecognized principal name format: {principal_name}")
-            return set()
+    # Check if user is in authorized users
+    if principal_normalized in AUTHORIZED_USERS:
+        logger.debug(f"User {principal_normalized} is explicitly authorized.")
+        return True
 
-        username = username.strip()
-
-        # Search for the user
-        search_base = 'DC=ad,DC=set'  # Adjust based on your AD structure
-        search_filter = f'(&(objectClass=user)(sAMAccountName={username}))'
-        conn.search(search_base, search_filter, attributes=['memberOf'])
-
-        if not conn.entries:
-            logger.error(f"User {username} not found in AD.")
-            return set()
-
-        user_entry = conn.entries[0]
-        member_of = user_entry.memberOf.values if 'memberOf' in user_entry else []
-
-        # Extract group names from distinguished names and normalize to uppercase
-        groups = set()
-        for dn in member_of:
-            # Assuming the group name is the CN
-            parts = dn.split(',')
-            for part in parts:
-                if part.startswith('CN='):
-                    group_name = part[3:].strip().upper()  # Convert to uppercase
-                    groups.add(group_name)
-                    break  # Only the CN part is needed
-
-        conn.unbind()
-        return groups
-
-    except Exception as e:
-        logger.exception("Failed to retrieve user groups from AD.")
-        return set()
+    logger.debug(f"User {principal_normalized} is not authorized.")
+    return False
 
 # -----------------------------------------------------------------------------
 # Kerberos/Negotiate Handler
@@ -104,7 +62,7 @@ def get_user_groups(principal_name):
 class KerberosNegotiateHandler(BaseHTTPRequestHandler):
     """
     An HTTP handler that performs SPNEGO/Kerberos authentication, enforces
-    authorization based on individual user accounts or group membership, and proxies
+    authorization based on individual user accounts, and proxies
     valid requests to 127.0.0.1:8080. Returns 404 if file not found upstream,
     403 if unauthorized, or if the path is not /login.asp.
     """
@@ -197,29 +155,12 @@ class KerberosNegotiateHandler(BaseHTTPRequestHandler):
     def authorize_user(self, principal_name):
         """
         Check if the authenticated user is authorized to access the resource based on
-        individual user accounts or group membership.
+        individual user accounts.
         Returns True if authorized, False otherwise.
         """
-        # Retrieve user groups from AD
-        groups = get_user_groups(principal_name)
-        logger.debug(f"User {principal_name} is member of groups: {groups}")
-        logger.debug(f"Normalized Authorized Groups: {AUTHORIZED_GROUPS}")
-
-        # Normalize principal name for comparison (already uppercase)
-        principal_normalized = principal_name  # Already uppercase
-
-        # Check if user is in authorized users
-        if principal_normalized in AUTHORIZED_USERS:
-            logger.debug(f"User {principal_name} is explicitly authorized.")
-            return True
-
-        # Check if user is in any authorized group
-        if AUTHORIZED_GROUPS.intersection(groups):
-            logger.debug(f"User {principal_name} is authorized via group membership.")
-            return True
-
-        logger.debug(f"User {principal_name} is not authorized.")
-        return False
+        # Authorization check against AUTHORIZED_USERS
+        is_authorized = authorize_user(principal_name)
+        return is_authorized
 
     def do_GET(self):
         """
