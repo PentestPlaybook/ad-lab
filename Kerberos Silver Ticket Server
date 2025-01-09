@@ -11,7 +11,7 @@ from ldap3 import Server, Connection, ALL, NTLM
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-KEYTAB_PATH = "FILE:C:\\Users\\daron.AD\\Documents\\web04.keytab"
+KEYTAB_PATH = "FILE:C:\\Users\\iis_service\\Documents\\web05.keytab"
 LISTEN_PORT = 80
 FORWARD_HOST = "127.0.0.1"
 FORWARD_PORT = 8080
@@ -22,8 +22,8 @@ LDAP_SERVER = 'ldaps://dc02.ad.set'          # Replace with your AD server addre
 LDAP_USER = 'AD\\betty'               # Service account with read access to AD
 LDAP_PASSWORD = 'Password123'              # Password for the service account
 AUTHORIZED_USERS = {
-    "AD\\DOES-NOT-EXIST",
-    "DOES-NOT-EXIST@AD.SET"
+    "AD\\IIS_SERVICE",
+    "IIS_SERVICE@AD.SET"
 }  # AD usernames in uppercase (DOMAIN\username and username@DOMAIN)
 AUTHORIZED_GROUPS = {"ADMINISTRATORS"}       # AD group names in uppercase
 
@@ -381,8 +381,8 @@ def main():
     server_address = ('0.0.0.0', LISTEN_PORT)
     httpd = ThreadedHTTPServer(server_address, KerberosNegotiateHandler)
 
-    # Ensure the server name matches your keytab principal: HTTP/web04.ad.set
-    httpd.server_name = 'web04.ad.set'
+    # Ensure the server name matches your keytab principal: HTTP/web05.ad.set
+    httpd.server_name = 'web05.ad.set'
 
     try:
         httpd.serve_forever()
