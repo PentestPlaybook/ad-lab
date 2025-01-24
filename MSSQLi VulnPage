@@ -35,6 +35,8 @@ Set rs   = Server.CreateObject("ADODB.Recordset")
 '
 On Error Resume Next
 conn.Open "Provider=SQLOLEDB;Data Source=web04;Initial Catalog=master;User ID=sa;Password=Password123!!;"
+# Or, use this line instead if using Windows Authentication instead of Anonymous Authentication in IIS:
+# conn.Open "Provider=SQLOLEDB;Data Source=web04;Initial Catalog=master;Integrated Security=SSPI;"
 
 If Err.Number <> 0 Then
     Response.Write "<h3>Connection Error: " & Err.Description & "</h3>"
